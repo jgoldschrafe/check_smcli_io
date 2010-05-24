@@ -1,0 +1,35 @@
+INTRODUCTION
+------------
+This plugin is designed to report performance data on LSI SANs (e.g. IBM
+DS4000/5000/6000 series) back to Nagios, where it can be charted by
+pnp4nagios. It is designed to be used with any version of pnp4nagios
+with support for storing datastores in individual RRDs.
+
+INSTALLATION
+------------
+These steps assume you are already running pnp4nagios >= 0.6.0 and have it
+configured with Nagios.
+
+- Install LSI's SMcli management utility. This script works by parsing the
+  output of this tool. It can go wherever you like -- you'll be passing
+  the absolute path of it to the Nagios plugin as a command-line argument.
+- Add the managed SAN to SMcli's registry so you can reference it later:
+
+    /opt/IBM_DS/client/SMcli -A <Primary_IP> <Secondary_IP>
+
+- Move the supplied files into their correct locations:
+  * check_smcli_io -> Nagios plugin dir (e.g. /usr/lib/nagios/plugins)
+  * check_smcli_io.cfg -> pnp4nagios check_commands dir (e.g.
+      /etc/pnp4nagios/check_commands)
+  * check_smcli_io.php -> pnp4nagios templates dir (e.g.
+      /usr/share/pnp4nagios/templates)
+
+  You may need to play with some paths in the check_smcli_io script in order
+  to fit your environment. I've tested it on 64-bit CentOS 5. It may or may
+  not work for you.
+- Add a service check that invokes check_smcli_io with the correct arguments.
+
+AUTHOR
+------
+This plugin was written by Jeff Goldschrafe <jeff@holyhandgrenade.org>.
+

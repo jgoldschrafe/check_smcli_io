@@ -1,0 +1,188 @@
+#!/usr/bin/perl -w
+
+# Author: Jeff Goldschrafe
+# Last modified: April 22, 2010
+#
+# Report performance data for IBM SAN back to Nagios. This check does not
+# perform any threshold checking whatsoever.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Nagios::Plugin;
+use Text::CSV_XS;
+
+my $np = Nagios::Plugin->new('shortname' => 'SMCLI_IO');
+
+my %physical_arrays = ();
+
+my $smcli = '/opt/IBM_DS/client/SMcli';
+my $instance = '';
+my $result_dir = '/var/spool/nagios';
+my $timeout = 0;
+my $verbose = 0;
+
+sub trim {
+    my $s = shift;
+    $s =~ s/^\s+//g;
+    $s =~ s/\s+$//g;
+    return $s;
+}
+
+sub parse_lu_array_map {
+    my ($output) = @_;
+    my @output_lines = split("\n", $output);
+
+    my %map = ();
+
+    my $heading_seen = 0;
+    
+    foreach my $line (@output_lines) {
+        if ($heading_seen == 1) {
+            $line = trim($line);
+            if ($line =~ /^$/) {
+                last;
+            } else {
+                my @fields = split(/\s+/, $line);
+                my ($lu_name, $array_name) = ($fields[0], $fields[5]);
+                $map{$lu_name} = $array_name;
+            }
+        } elsif ($line =~ /^   NAME/) {
+            $heading_seen = 1;
+        }
+    }
+
+    return \%map;
+}
+
+#
+# Parse command-line options
+#
+GetOptions(
+    'c|smcli=s'      => \$smcli,
+    'i|instance=s'   => \$instance,
+    'v|verbose'      => \$verbose
+);
+
+#
+# Validate given options
+#
+unless (-f $smcli) {
+    $np->nagios_exit(UNKNOWN, "SMcli not found at '$smcli'");
+}
+
+unless (-x $smcli) {
+    $np->nagios_exit(UNKNOWN, "'$smcli' is not executable");
+}
+
+unless (-d $result_dir) {
+    $np->nagios_exit(UNKNOWN, "Result directory '$result_dir' does not exist");
+}
+
+my $result_file = "$result_dir/SMcli-$instance.csv";
+my $smcmd = "set session performanceMonitorInterval=15 performanceMonitorIterations=1; show allLogicalDrives; save storagesubsystem performanceStats file=\"$result_file\";";
+
+#
+# Gather performance information
+#
+my $output = `sudo $smcli -n '$instance' -c '$smcmd' 2>/dev/null`;
+
+if (! -f $result_file) {
+    $np->nagios_exit(CRITICAL, 'Could not collect SAN performance data.');
+}
+
+#
+# Map LUs to their corresponding physical arrays
+#
+my $lu_array_map = parse_lu_array_map($output);
+
+#
+# Parse CSV output
+# 
+my $csv = Text::CSV_XS->new();
+
+open(CSV, "<$result_file");
+my @csv_lines = <CSV>;
+# First 8 lines are CSV headers, so remove them
+@csv_lines = @csv_lines[7..(scalar @csv_lines - 1)];
+close(CSV);
+
+#
+# Parse the CSV for relevant performance information about our LUs
+# 
+for (my $i = 0; $i < scalar @csv_lines; $i++) {
+    my $line = $csv_lines[$i];
+    if ($csv->parse($line)) {
+        my @cols = $csv->fields();
+
+        my ($name, $read_pct, $cache_hit_pct, $max_kb, $max_iops) =
+          ($cols[0], $cols[2], $cols[3], $cols[5], $cols[7]);
+        
+        my $perfdata_name = $name;
+
+        # If the drive is a logical drive, add the appropriate numbers to the
+        # corresponding physical array so we can track I/O by array as well.
+        if ($name =~ /^Logical Drive (.*)$/) {
+            $perfdata_name = "LU $1";
+            my $lu_name = $1;
+
+            # If the name doesn't exist in the mapping table, we're looking at
+            # a snapshot. These don't map to a physical array, so we don't
+            # process them.
+            if (exists $lu_array_map->{$lu_name}) {
+                my $array_name = $lu_array_map->{$lu_name};
+               
+                $physical_arrays{$array_name} ||= {'iops' => 0, 'kb' => 0};
+                $physical_arrays{$array_name}->{'iops'} += $max_iops;
+                $physical_arrays{$array_name}->{'kb'} += $max_kb;
+            }
+        } elsif ($name =~ /^CONTROLLER IN SLOT (.*)$/) {
+            $perfdata_name = "CONTROLLER $1";
+        } elsif ($name =~ /^STORAGE SUBSYSTEM TOTALS$/) {
+            $perfdata_name = 'TOTAL Total';
+        }
+
+        $np->add_perfdata(
+            'label' => "$perfdata_name Read Pct",
+            'value' => $read_pct,
+            'uom'   => '%'
+        );
+        $np->add_perfdata(
+            'label' => "$perfdata_name Cache Hit Pct",
+            'value' => $cache_hit_pct,
+            'uom'   => '%'
+        );
+        $np->add_perfdata(
+            'label' => "$perfdata_name Throughput",
+            'value' => $max_kb,
+            'uom'   => 'k'
+        );
+        $np->add_perfdata(
+            'label' => "$perfdata_name IOPS",
+            'value' => $max_iops
+        );
+    } else {
+        print STDERR "Error parsing line: $line\n";
+    }
+}
+
+foreach my $array_name (keys %physical_arrays) {
+    my $array = $physical_arrays{$array_name};
+    my $iops = $array->{'iops'};
+    my $kb = $array->{'kb'};
+    
+    $np->add_perfdata(
+        'label' => "ARRAY $array_name IOPS",
+        'value' => $iops
+    );
+    $np->add_perfdata(
+        'label' => "ARRAY $array_name Throughput",
+        'value' => $kb
+    );
+}
+
+unlink($result_file);
+
+$np->nagios_exit(OK, 'Retrieved performance counters from storage processor.');
+
